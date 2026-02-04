@@ -8,6 +8,8 @@
 [![License](https://img.shields.io/badge/license-MIT-brightgreen.svg)](LICENSE)
 [![AgentSkills](https://img.shields.io/badge/AgentSkills-compatible-orange.svg)](https://agentskills.io)
 
+> 🦞 **Legacy Users:** This skill works with **Clawdbot** and **Moltbot** (now OpenClaw). If you're searching for *Moltbot Security*, *Clawdbot Swarm*, or *Moltbot multi-agent* — you're in the right place!
+
 An [AgentSkills](https://agentskills.io)-compatible skill that enables multi-agent coordination, task delegation, and permission-controlled access to sensitive APIs (databases, payments, external services, etc.).
 
 ## 🎯 Features
@@ -243,3 +245,12 @@ MIT License - See [LICENSE](LICENSE)
 ---
 
 **Compatible with OpenClaw 2026.2.x and AgentSkills specification**
+
+---
+
+<details>
+<summary>🔍 Keywords (for search)</summary>
+
+OpenClaw, Clawdbot, Moltbot, Clawdbot Swarm, Moltbot Security, Moltbot multi-agent, OpenClaw skills, multi-agent orchestration, agent coordination, swarm intelligence, AI agents, token permissions, agent handoffs, blackboard pattern, agent budget tracking, cost awareness, atomic commits, AgentSkills, Clawdbot plugins, Moltbot extensions
+
+</details>
