@@ -19,6 +19,9 @@ An [AgentSkills](https://agentskills.io)-compatible skill that enables multi-age
 - **Shared Blackboard** - Markdown-based coordination state for agent communication
 - **Parallel Execution Patterns** - Merge, vote, chain, and first-success synthesis strategies
 - **Swarm Guard** - Prevents "Handoff Tax" (wasted tokens) and detects silent agent failures
+- **Atomic Commits** - File-system mutexes prevent split-brain in concurrent writes
+- **Cost Awareness** - Token budget tracking with automatic SafetyShutdown
+- **Budget-Aware Handoffs** - `intercept-handoff` command wraps `sessions_send` with budget checks
 
 ## 📁 Skill Structure
 
@@ -29,16 +32,19 @@ swarm-orchestrator/
 │   ├── check_permission.py   # AuthGuardian permission checker
 │   ├── validate_token.py     # Token validation
 │   ├── revoke_token.py       # Token revocation
-│   ├── blackboard.py         # Shared state management
-│   └── swarm_guard.py        # Handoff tax & failure prevention
+│   ├── blackboard.py         # Shared state management (with atomic commits)
+│   └── swarm_guard.py        # Handoff tax, failure prevention, & budget tracking
 ├── references/           # Detailed documentation
 │   ├── auth-guardian.md      # Permission system details
 │   ├── blackboard-schema.md  # Data structure specs
-│   └── trust-levels.md       # Agent trust configuration
-├── lib/                  # TypeScript utilities (optional)
-│   └── swarm-utils.ts        # Node.js implementation
+│   ├── trust-levels.md       # Agent trust configuration
+│   └── mcp-roadmap.md        # MCP networking implementation plan
+├── lib/                  # TypeScript utilities
+│   ├── swarm-utils.ts        # Node.js implementation
+│   └── locked-blackboard.ts  # Atomic commits with file-system mutexes
 └── data/                 # Runtime data (auto-created)
     ├── active_grants.json    # Current permission grants
+    ├── budget_tracking.json  # Token budget per task
     └── audit_log.jsonl       # Security audit trail
 ```
 
@@ -83,7 +89,36 @@ cp -r /path/to/Network-AI/openclaw-swarm-skill ~/.openclaw/workspace/skills/swar
 
 ## 📖 Usage
 
-### 1. Delegate Tasks
+### 1. Initialize Budget (First!)
+
+**Always start with a budget for cost control:**
+
+```bash
+python scripts/swarm_guard.py budget-init --task-id "task_001" --budget 10000
+```
+
+### 2. Budget-Aware Handoffs
+
+**Use `intercept-handoff` before every `sessions_send`:**
+
+```bash
+python scripts/swarm_guard.py intercept-handoff \
+  --task-id "task_001" \
+  --from orchestrator \
+  --to data_analyst \
+  --message "Analyze Q4 revenue data"
+```
+
+Output (if allowed):
+```
+✅ HANDOFF ALLOWED: orchestrator → data_analyst
+   Tokens spent: 156
+   Budget remaining: 9,844
+   Handoff #1 (remaining: 2)
+   → Proceed with sessions_send
+```
+
+### 3. Delegate Tasks
 
 Use OpenClaw's session tools to delegate work:
 
@@ -93,7 +128,7 @@ sessions_send    # Send task to another session
 sessions_history # Check results
 ```
 
-### 2. Check Permissions
+### 4. Check Permissions
 
 Before accessing sensitive APIs:
 
@@ -121,11 +156,20 @@ python scripts/blackboard.py write "task:analysis" '{"status": "running"}'
 # Read
 python scripts/blackboard.py read "task:analysis"
 
+# Atomic commit workflow (for multi-agent safety)
+python scripts/blackboard.py propose "chg_001" "key" '{"value": 1}'
+python scripts/blackboard.py validate "chg_001"
+python scripts/blackboard.py commit "chg_001"
+
 # List all keys
 python scripts/blackboard.py list
+```
 
-# Full snapshot
-python scripts/blackboard.py snapshot
+### 4. Check Budget Status
+
+```bash
+python scripts/swarm_guard.py budget-check --task-id "task_001"
+python scripts/swarm_guard.py budget-report --task-id "task_001"
 ```
 
 ## 🔐 Permission System
@@ -207,10 +251,11 @@ Logged events: `permission_granted`, `permission_denied`, `permission_revoked`, 
 
 ## 📚 Documentation
 
-- [SKILL.md](SKILL.md) - Main skill instructions
+- [SKILL.md](SKILL.md) - Main skill instructions (includes Orchestrator protocol)
 - [references/auth-guardian.md](references/auth-guardian.md) - Permission system details
 - [references/blackboard-schema.md](references/blackboard-schema.md) - Data structures
 - [references/trust-levels.md](references/trust-levels.md) - Trust configuration
+- [references/mcp-roadmap.md](references/mcp-roadmap.md) - MCP networking implementation plan
 
 ## 🔧 Configuration
 
