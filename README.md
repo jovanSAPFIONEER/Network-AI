@@ -2,7 +2,7 @@
 
 **Multi-Agent Swarm Orchestration Skill for OpenClaw**
 
-[![Release](https://img.shields.io/badge/release-v1.0.0-blue.svg)](https://github.com/jovanSAPFIONEER/Network-AI/releases)
+[![Release](https://img.shields.io/badge/release-v2.0.0-blue.svg)](https://github.com/jovanSAPFIONEER/Network-AI/releases)
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-v2026.2.x-red.svg)](https://github.com/OpenClaw/openclaw)
 [![Python](https://img.shields.io/badge/python-3.9+-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen.svg)](LICENSE)
