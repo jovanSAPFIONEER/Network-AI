@@ -1,0 +1,188 @@
+{
+  "name": "SwarmOrchestrator",
+  "version": "1.0.0",
+  "description": "Multi-Agent Swarm Orchestrator for OpenClaw ecosystem. Enables agent-to-agent communication, shared memory via blackboard pattern, and permission-gated access to sensitive APIs.",
+  "author": "OpenClaw Community",
+  "license": "MIT",
+  "tags": ["OpenClaw", "A2A", "swarm", "multi-agent", "orchestration"],
+  "runtime": "node",
+  "entrypoint": "index.ts",
+  "gateway": "local",
+  "capabilities": {
+    "delegate_task": {
+      "description": "Delegate a task to a specialized sub-agent within the swarm",
+      "parameters": {
+        "targetAgent": {
+          "type": "string",
+          "required": true,
+          "description": "The identifier of the target agent to receive the task"
+        },
+        "taskPayload": {
+          "type": "object",
+          "required": true,
+          "description": "The task context, instructions, and any required data"
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "critical"],
+          "default": "normal",
+          "description": "Task priority level for queue ordering"
+        },
+        "timeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "Maximum execution time in milliseconds"
+        },
+        "requiresAuth": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether this task requires AuthGuardian permission grant"
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "taskId": { "type": "string" },
+          "status": { "type": "string" },
+          "result": { "type": "any" },
+          "agentTrace": { "type": "array" }
+        }
+      }
+    },
+    "query_swarm_state": {
+      "description": "Query the current state of the agent swarm, including active tasks, blackboard contents, and agent availability",
+      "parameters": {
+        "scope": {
+          "type": "string",
+          "enum": ["all", "agents", "tasks", "blackboard", "permissions"],
+          "default": "all",
+          "description": "The scope of state information to retrieve"
+        },
+        "agentFilter": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional list of agent IDs to filter results"
+        },
+        "includeHistory": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include historical task execution data"
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "timestamp": { "type": "string" },
+          "activeAgents": { "type": "array" },
+          "pendingTasks": { "type": "array" },
+          "blackboardSnapshot": { "type": "object" },
+          "permissionGrants": { "type": "array" }
+        }
+      }
+    },
+    "spawn_parallel_agents": {
+      "description": "Spawn multiple sub-agents in parallel for complex task decomposition",
+      "parameters": {
+        "tasks": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "properties": {
+              "agentType": { "type": "string" },
+              "taskPayload": { "type": "object" }
+            }
+          },
+          "description": "Array of parallel tasks to execute"
+        },
+        "synthesisStrategy": {
+          "type": "string",
+          "enum": ["merge", "vote", "chain", "first-success"],
+          "default": "merge",
+          "description": "How to combine results from parallel agents"
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "synthesizedResult": { "type": "any" },
+          "individualResults": { "type": "array" },
+          "executionMetrics": { "type": "object" }
+        }
+      }
+    },
+    "request_permission": {
+      "description": "Request permission from AuthGuardian for sensitive operations",
+      "parameters": {
+        "resourceType": {
+          "type": "string",
+          "enum": ["SAP_API", "FINANCIAL_API", "EXTERNAL_SERVICE", "DATA_EXPORT"],
+          "required": true,
+          "description": "The type of protected resource being requested"
+        },
+        "justification": {
+          "type": "string",
+          "required": true,
+          "description": "Reason for requesting access"
+        },
+        "scope": {
+          "type": "string",
+          "description": "Specific scope of access needed"
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "granted": { "type": "boolean" },
+          "grantToken": { "type": "string" },
+          "expiresAt": { "type": "string" },
+          "restrictions": { "type": "array" }
+        }
+      }
+    },
+    "update_blackboard": {
+      "description": "Write or update entries on the shared blackboard for cross-agent coordination",
+      "parameters": {
+        "key": {
+          "type": "string",
+          "required": true,
+          "description": "The blackboard entry key"
+        },
+        "value": {
+          "type": "any",
+          "required": true,
+          "description": "The data to store"
+        },
+        "ttl": {
+          "type": "number",
+          "description": "Time-to-live in seconds (optional)"
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "previousValue": { "type": "any" }
+        }
+      }
+    }
+  },
+  "permissions": {
+    "required": ["local_filesystem", "internal_skill_calls"],
+    "optional": ["external_api_access"],
+    "authGuardian": {
+      "enabled": true,
+      "protectedResources": ["SAP_API", "FINANCIAL_API", "EXTERNAL_SERVICE", "DATA_EXPORT"]
+    }
+  },
+  "dependencies": {
+    "openclaw-core": "^2.0.0",
+    "agent-skills-protocol": "^1.0.0"
+  },
+  "config": {
+    "blackboardPath": "./swarm-blackboard.md",
+    "maxParallelAgents": 3,
+    "defaultTimeout": 30000,
+    "enableTracing": true
+  }
+}

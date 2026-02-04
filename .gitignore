@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Runtime data
+data/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+
+# Build outputs
+dist/
+*.js.map
+
+# Test artifacts
+test-*.log
+security-audit.log
