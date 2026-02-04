@@ -222,6 +222,90 @@ Sequential processing - output of one feeds into next.
 4. **Check token expiry** - tokens are valid for 5 minutes
 5. **Audit trail** - all permission requests are logged
 
+## 📝 Audit Trail Requirements (MANDATORY)
+
+**Every sensitive action MUST be logged to `data/audit_log.jsonl`** to maintain compliance and enable forensic analysis.
+
+### What Gets Logged Automatically
+
+The scripts automatically log these events:
+- `permission_granted` - When access is approved
+- `permission_denied` - When access is rejected
+- `permission_revoked` - When a token is manually revoked
+- `ttl_cleanup` - When expired tokens are purged
+- `result_validated` / `result_rejected` - Swarm Guard validations
+
+### Log Entry Format
+
+```json
+{
+  "timestamp": "2026-02-04T10:30:00+00:00",
+  "action": "permission_granted",
+  "details": {
+    "agent_id": "data_analyst",
+    "resource_type": "DATABASE",
+    "justification": "Q4 revenue analysis",
+    "token": "grant_abc123...",
+    "restrictions": ["read_only", "max_records:100"]
+  }
+}
+```
+
+### Reading the Audit Log
+
+```bash
+# View recent entries (last 10)
+tail -10 {baseDir}/data/audit_log.jsonl
+
+# Search for specific agent
+grep "data_analyst" {baseDir}/data/audit_log.jsonl
+
+# Count actions by type
+cat {baseDir}/data/audit_log.jsonl | jq -r '.action' | sort | uniq -c
+```
+
+### Custom Audit Entries
+
+If you perform a sensitive action manually, log it:
+
+```python
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+audit_file = Path("{baseDir}/data/audit_log.jsonl")
+entry = {
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "action": "manual_data_access",
+    "details": {
+        "agent": "orchestrator",
+        "description": "Direct database query for debugging",
+        "justification": "Investigating data sync issue #1234"
+    }
+}
+with open(audit_file, "a") as f:
+    f.write(json.dumps(entry) + "\n")
+```
+
+## 🧹 TTL Enforcement (Token Lifecycle)
+
+Expired permission tokens are automatically tracked. Run periodic cleanup:
+
+```bash
+# List expired tokens (without removing)
+python {baseDir}/scripts/revoke_token.py --list-expired
+
+# Remove all expired tokens
+python {baseDir}/scripts/revoke_token.py --cleanup
+
+# Output:
+# 🧹 TTL Cleanup Complete
+#    Removed: 3 expired token(s)
+#    Remaining active grants: 2
+```
+
+**Best Practice**: Run `--cleanup` at the start of each multi-agent task to ensure a clean permission state.
+
 ## ⚠️ Swarm Guard: Preventing Common Failures
 
 Two critical issues can derail multi-agent swarms:

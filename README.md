@@ -55,6 +55,7 @@ openclaw skills install swarm-orchestrator
 git clone https://github.com/jovanSAPFIONEER/Network-AI
 cd Network-AI/openclaw-swarm-skill
 npm install  # For TypeScript utilities (optional)
+pip install -r requirements.txt  # For Python scripts (optional - uses stdlib)
 ```
 
 ### Quick Install for OpenClaw
@@ -174,9 +175,27 @@ python scripts/check_permission.py --agent orchestrator --resource PAYMENTS \
 python scripts/blackboard.py write "test:key" '{"value": 123}' --ttl 60
 python scripts/blackboard.py read "test:key"
 
+# Test TTL cleanup
+python scripts/revoke_token.py --list-expired
+python scripts/revoke_token.py --cleanup
+
 # TypeScript tests (optional)
 npm test
 ```
+
+## 📋 Audit Trail
+
+All sensitive actions are logged to `data/audit_log.jsonl`:
+
+```bash
+# View recent audit entries
+tail -10 data/audit_log.jsonl
+
+# Search for specific agent
+grep "data_analyst" data/audit_log.jsonl
+```
+
+Logged events: `permission_granted`, `permission_denied`, `permission_revoked`, `ttl_cleanup`, `result_validated`
 
 ## 📚 Documentation
 

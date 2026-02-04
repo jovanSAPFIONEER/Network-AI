@@ -1,0 +1,11 @@
+# Python dependencies for Swarm Orchestrator Skill
+# Install: pip install -r requirements.txt
+
+# No external dependencies required - uses Python stdlib only
+# Python 3.9+ recommended for type hints
+
+# If you want to run type checking:
+# mypy>=1.0.0
+
+# If you want to run tests:
+# pytest>=7.0.0
