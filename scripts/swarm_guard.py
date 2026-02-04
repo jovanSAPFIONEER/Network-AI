@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-Swarm Guard - Prevents Handoff Tax and Silent Failures
+Swarm Guard - Prevents Handoff Tax, Silent Failures, and Budget Overruns
 
-Two critical issues in multi-agent swarms:
+Three critical issues in multi-agent swarms:
 1. HANDOFF TAX: Agents waste tokens "talking about" work instead of doing it
 2. SILENT FAILURE: One agent fails, others keep working on bad data
+3. BUDGET OVERRUN: Infinite loops burn $500 in API credits in an hour
 
 Usage:
     python swarm_guard.py check-handoff --task-id TASK_ID
     python swarm_guard.py validate-result --task-id TASK_ID --agent AGENT_ID
     python swarm_guard.py health-check --agent AGENT_ID
     python swarm_guard.py supervisor-review --task-id TASK_ID
+    
+    # Budget/Cost Awareness:
+    python swarm_guard.py budget-init --task-id TASK_ID --budget 10000
+    python swarm_guard.py budget-check --task-id TASK_ID
+    python swarm_guard.py budget-spend --task-id TASK_ID --tokens 500 --reason "API call"
 
 Examples:
     python swarm_guard.py check-handoff --task-id "task_001"
-    python swarm_guard.py validate-result --task-id "task_001" --agent data_analyst
+    python swarm_guard.py budget-init --task-id "task_001" --budget 10000
+    python swarm_guard.py budget-spend --task-id "task_001" --tokens 500 --reason "LLM call"
 """
 
 import argparse
@@ -27,6 +34,7 @@ from typing import Any, Optional, Union
 # Configuration
 DATA_DIR = Path(__file__).parent.parent / "data"
 BLACKBOARD_PATH = Path(__file__).parent.parent / "swarm-blackboard.md"
+AUDIT_LOG = DATA_DIR / "audit_log.jsonl"
 
 # ============================================================================
 # HANDOFF TAX LIMITS
@@ -57,21 +65,58 @@ REQUIRED_RESULT_FIELDS = ["status", "output", "confidence"]
 # Confidence threshold for auto-approval
 MIN_CONFIDENCE_THRESHOLD = 0.7
 
+# ============================================================================
+# COST AWARENESS / TOKEN BUDGET
+# ============================================================================
+
+# Default max token budget per task (prevents infinite loops)
+DEFAULT_MAX_TOKEN_BUDGET = 50000
+
+# Warning threshold (percentage of budget)
+BUDGET_WARNING_THRESHOLD = 0.75  # Warn at 75%
+
+# Hard stop threshold (percentage of budget)
+BUDGET_HARD_STOP_THRESHOLD = 1.0  # Stop at 100%
+
+# Estimated token costs for common operations
+TOKEN_COSTS = {
+    "handoff": 150,        # Estimated tokens per handoff message
+    "api_call": 500,       # Average API call
+    "llm_query": 1000,     # LLM inference call
+    "file_read": 200,      # Reading a file
+    "file_write": 300,     # Writing a file
+    "validation": 100,     # Result validation
+}
+
+
+def log_audit(action: str, details: dict[str, Any]) -> None:
+    """Append entry to audit log."""
+    AUDIT_LOG.parent.mkdir(exist_ok=True)
+    entry: dict[str, Any] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": action,
+        "details": details
+    }
+    with open(AUDIT_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
 
 class SwarmGuard:
-    """Monitors swarm health and prevents common failure modes."""
+    """Monitors swarm health, prevents common failure modes, and enforces budgets."""
     
     def __init__(self):
         self.data_dir = DATA_DIR
         self.data_dir.mkdir(exist_ok=True)
         self.task_log_path = self.data_dir / "task_tracking.json"
         self.health_log_path = self.data_dir / "agent_health.json"
+        self.budget_log_path = self.data_dir / "budget_tracking.json"
         self._load_state()
     
     def _load_state(self) -> None:
         """Load tracking state from disk."""
         self.task_tracking: dict[str, Any] = {}
         self.agent_health: dict[str, Any] = {}
+        self.budget_tracking: dict[str, Any] = {}
         
         if self.task_log_path.exists():
             try:
@@ -84,11 +129,18 @@ class SwarmGuard:
                 self.agent_health = json.loads(self.health_log_path.read_text())
             except json.JSONDecodeError:
                 pass
+        
+        if self.budget_log_path.exists():
+            try:
+                self.budget_tracking = json.loads(self.budget_log_path.read_text())
+            except json.JSONDecodeError:
+                pass
     
     def _save_state(self) -> None:
         """Persist tracking state to disk."""
         self.task_log_path.write_text(json.dumps(self.task_tracking, indent=2))
         self.health_log_path.write_text(json.dumps(self.agent_health, indent=2))
+        self.budget_log_path.write_text(json.dumps(self.budget_tracking, indent=2))
     
     # ========================================================================
     # HANDOFF TAX PREVENTION
@@ -414,11 +466,22 @@ class SwarmGuard:
             issues.append(f"UNHEALTHY_AGENTS: {unhealthy_agents}")
             recommendations.append("Do not trust pending results from unhealthy agents")
         
+        # Check budget status
+        budget_status = self.check_budget(task_id)
+        if budget_status.get("initialized"):
+            usage_pct = budget_status.get("usage_percentage", 0)
+            if usage_pct >= 100:
+                issues.append(f"BUDGET_EXCEEDED: {usage_pct:.0f}% of budget used")
+                recommendations.append("Task must stop - budget exhausted")
+            elif usage_pct >= 75:
+                issues.append(f"BUDGET_WARNING: {usage_pct:.0f}% of budget used")
+                recommendations.append("Complete task soon or request budget increase")
+        
         # Verdict
         if len(issues) == 0:
             verdict = "APPROVED"
             status = "healthy"
-        elif any("VALIDATION_FAILURES" in i or "UNHEALTHY_AGENTS" in i for i in issues):
+        elif any("VALIDATION_FAILURES" in i or "UNHEALTHY_AGENTS" in i or "BUDGET_EXCEEDED" in i for i in issues):
             verdict = "BLOCKED"
             status = "critical"
         else:
@@ -436,11 +499,214 @@ class SwarmGuard:
             "issues": issues,
             "recommendations": recommendations
         }
+    
+    # ========================================================================
+    # COST AWARENESS / TOKEN BUDGET
+    # ========================================================================
+    
+    def init_budget(self, task_id: str, max_tokens: int = DEFAULT_MAX_TOKEN_BUDGET,
+                    description: str = "") -> dict[str, Any]:
+        """
+        Initialize a token budget for a task.
+        This MUST be called before any work begins to enable cost tracking.
+        """
+        if task_id in self.budget_tracking:
+            return {
+                "initialized": False,
+                "error": f"Budget already exists for task '{task_id}'. Use budget-check to view."
+            }
+        
+        self.budget_tracking[task_id] = {
+            "max_tokens": max_tokens,
+            "used_tokens": 0,
+            "remaining_tokens": max_tokens,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "description": description,
+            "spending_log": [],
+            "status": "active"
+        }
+        
+        self._save_state()
+        
+        log_audit("budget_initialized", {
+            "task_id": task_id,
+            "max_tokens": max_tokens,
+            "description": description
+        })
+        
+        return {
+            "initialized": True,
+            "task_id": task_id,
+            "max_tokens": max_tokens,
+            "message": f"Budget initialized: {max_tokens:,} tokens"
+        }
+    
+    def check_budget(self, task_id: str) -> dict[str, Any]:
+        """
+        Check current budget status for a task.
+        Returns remaining budget, usage percentage, and warnings.
+        """
+        if task_id not in self.budget_tracking:
+            return {
+                "task_id": task_id,
+                "initialized": False,
+                "error": "No budget tracking for this task. Run budget-init first."
+            }
+        
+        budget = self.budget_tracking[task_id]
+        usage_pct = (budget["used_tokens"] / budget["max_tokens"]) * 100 if budget["max_tokens"] > 0 else 0
+        
+        # Determine status
+        if usage_pct >= BUDGET_HARD_STOP_THRESHOLD * 100:
+            status = "EXHAUSTED"
+            can_continue = False
+        elif usage_pct >= BUDGET_WARNING_THRESHOLD * 100:
+            status = "WARNING"
+            can_continue = True
+        else:
+            status = "OK"
+            can_continue = True
+        
+        return {
+            "task_id": task_id,
+            "initialized": True,
+            "max_tokens": budget["max_tokens"],
+            "used_tokens": budget["used_tokens"],
+            "remaining_tokens": budget["remaining_tokens"],
+            "usage_percentage": usage_pct,
+            "status": status,
+            "can_continue": can_continue,
+            "spending_count": len(budget["spending_log"])
+        }
+    
+    def spend_budget(self, task_id: str, tokens: int, reason: str,
+                     agent_id: str = "unknown", operation: str = "unknown") -> dict[str, Any]:
+        """
+        Record token spending against the task budget.
+        This acts as the "Tax Collector" - call before every API/LLM operation.
+        
+        Returns:
+        - allowed: True if spend was recorded
+        - blocked: True if budget exceeded (HARD STOP triggered)
+        """
+        if task_id not in self.budget_tracking:
+            return {
+                "allowed": False,
+                "error": "No budget tracking for this task. Run budget-init first."
+            }
+        
+        budget = self.budget_tracking[task_id]
+        
+        # Check if we're already over budget
+        if budget["status"] == "exhausted":
+            return self._trigger_safety_shutdown(task_id, "Budget already exhausted")
+        
+        # Check if this spend would exceed budget
+        new_total = budget["used_tokens"] + tokens
+        if new_total > budget["max_tokens"]:
+            budget["status"] = "exhausted"
+            self._save_state()
+            return self._trigger_safety_shutdown(
+                task_id, 
+                f"Spend of {tokens:,} would exceed budget. "
+                f"Current: {budget['used_tokens']:,}/{budget['max_tokens']:,}"
+            )
+        
+        # Record the spend
+        spend_record: dict[str, Union[str, int]] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tokens": tokens,
+            "reason": reason,
+            "agent_id": agent_id,
+            "operation": operation,
+            "running_total": new_total
+        }
+        
+        budget["spending_log"].append(spend_record)
+        budget["used_tokens"] = new_total
+        budget["remaining_tokens"] = budget["max_tokens"] - new_total
+        
+        # Check for warning threshold
+        usage_pct = (new_total / budget["max_tokens"]) * 100
+        warning = None
+        if usage_pct >= BUDGET_WARNING_THRESHOLD * 100:
+            warning = f"⚠️ Budget at {usage_pct:.0f}% - complete task soon!"
+        
+        self._save_state()
+        
+        return {
+            "allowed": True,
+            "task_id": task_id,
+            "tokens_spent": tokens,
+            "reason": reason,
+            "used_tokens": new_total,
+            "remaining_tokens": budget["remaining_tokens"],
+            "usage_percentage": usage_pct,
+            "warning": warning
+        }
+    
+    def _trigger_safety_shutdown(self, task_id: str, reason: str) -> dict[str, Any]:
+        """
+        Trigger a safety shutdown when budget is exceeded.
+        This is the HARD STOP that prevents runaway costs.
+        """
+        log_audit("safety_shutdown", {
+            "task_id": task_id,
+            "reason": reason,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        
+        # Mark task as terminated in tracking
+        if task_id in self.task_tracking:
+            self.task_tracking[task_id]["status"] = "budget_terminated"
+            self._save_state()
+        
+        return {
+            "allowed": False,
+            "blocked": True,
+            "task_id": task_id,
+            "reason": "SAFETY_SHUTDOWN",
+            "message": f"🛑 BUDGET EXCEEDED: Task '{task_id}' ABORTED. {reason}",
+            "action_required": "Task terminated. Do NOT continue. Report to supervisor."
+        }
+    
+    def get_budget_report(self, task_id: str) -> dict[str, Any]:
+        """Get detailed spending report for a task."""
+        if task_id not in self.budget_tracking:
+            return {"error": "No budget tracking for this task."}
+        
+        budget = self.budget_tracking[task_id]
+        
+        # Aggregate by operation type
+        by_operation: dict[str, int] = {}
+        by_agent: dict[str, int] = {}
+        
+        for spend in budget["spending_log"]:
+            op = spend.get("operation", "unknown")
+            agent = spend.get("agent_id", "unknown")
+            tokens = spend.get("tokens", 0)
+            
+            by_operation[op] = by_operation.get(op, 0) + tokens
+            by_agent[agent] = by_agent.get(agent, 0) + tokens
+        
+        return {
+            "task_id": task_id,
+            "summary": {
+                "max_tokens": budget["max_tokens"],
+                "used_tokens": budget["used_tokens"],
+                "remaining_tokens": budget["remaining_tokens"],
+                "usage_percentage": (budget["used_tokens"] / budget["max_tokens"]) * 100
+            },
+            "by_operation": by_operation,
+            "by_agent": by_agent,
+            "spending_log": budget["spending_log"],
+            "created_at": budget["created_at"]
+        }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Swarm Guard - Prevent Handoff Tax and Silent Failures",
+        description="Swarm Guard - Prevent Handoff Tax, Silent Failures, and Budget Overruns",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
@@ -450,19 +716,30 @@ Commands:
   health-check       Check if an agent is healthy
   heartbeat          Record agent heartbeat
   supervisor-review  Full supervisor review of task state
+  
+  Budget Management (Cost Awareness):
+  budget-init        Initialize token budget for a task
+  budget-check       Check remaining budget
+  budget-spend       Record token spending (the "Tax Collector")
+  budget-report      Get detailed spending report
 
 Examples:
   %(prog)s check-handoff --task-id "task_001"
   %(prog)s record-handoff --task-id "task_001" --from orchestrator --to analyst --message "Analyze data"
   %(prog)s validate-result --task-id "task_001" --agent analyst --result '{"status":"ok","output":"...","confidence":0.9}'
   %(prog)s health-check --agent data_analyst
-  %(prog)s supervisor-review --task-id "task_001"
+  
+  # Cost control:
+  %(prog)s budget-init --task-id "task_001" --budget 10000
+  %(prog)s budget-spend --task-id "task_001" --tokens 500 --reason "LLM query"
+  %(prog)s budget-check --task-id "task_001"
 """
     )
     
     parser.add_argument("command", choices=[
         "check-handoff", "record-handoff", "validate-result",
-        "health-check", "heartbeat", "supervisor-review"
+        "health-check", "heartbeat", "supervisor-review",
+        "budget-init", "budget-check", "budget-spend", "budget-report"
     ])
     parser.add_argument("--task-id", "-t", help="Task ID")
     parser.add_argument("--agent", "-a", help="Agent ID")
@@ -472,6 +749,12 @@ Examples:
     parser.add_argument("--artifact", action="store_true", help="Handoff includes artifact")
     parser.add_argument("--result", "-r", help="Result JSON (for validate-result)")
     parser.add_argument("--status", "-s", default="active", help="Agent status (for heartbeat)")
+    parser.add_argument("--budget", "-b", type=int, default=DEFAULT_MAX_TOKEN_BUDGET,
+                        help=f"Max token budget (default: {DEFAULT_MAX_TOKEN_BUDGET:,})")
+    parser.add_argument("--tokens", type=int, help="Tokens to spend (for budget-spend)")
+    parser.add_argument("--reason", help="Reason for spending (for budget-spend)")
+    parser.add_argument("--operation", "-o", default="unknown", help="Operation type")
+    parser.add_argument("--description", "-d", default="", help="Task description")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     
     args = parser.parse_args()
@@ -520,6 +803,35 @@ Examples:
             print("Error: --task-id required", file=sys.stderr)
             sys.exit(1)
         result = guard.supervisor_review(args.task_id)
+    
+    # === BUDGET COMMANDS ===
+    
+    elif args.command == "budget-init":
+        if not args.task_id:
+            print("Error: --task-id required", file=sys.stderr)
+            sys.exit(1)
+        result = guard.init_budget(args.task_id, args.budget, args.description)
+    
+    elif args.command == "budget-check":
+        if not args.task_id:
+            print("Error: --task-id required", file=sys.stderr)
+            sys.exit(1)
+        result = guard.check_budget(args.task_id)
+    
+    elif args.command == "budget-spend":
+        if not args.task_id or not args.tokens or not args.reason:
+            print("Error: --task-id, --tokens, --reason required", file=sys.stderr)
+            sys.exit(1)
+        result = guard.spend_budget(
+            args.task_id, args.tokens, args.reason,
+            args.agent or "unknown", args.operation
+        )
+    
+    elif args.command == "budget-report":
+        if not args.task_id:
+            print("Error: --task-id required", file=sys.stderr)
+            sys.exit(1)
+        result = guard.get_budget_report(args.task_id)
     
     else:
         print(f"Error: Unknown command '{args.command}'", file=sys.stderr)
@@ -607,6 +919,80 @@ def _pretty_print(command: str, result: dict[str, Any]) -> None:
         
         for rec in result.get("recommendations", []):
             print(f"   💡 {rec}")
+    
+    # === BUDGET COMMANDS ===
+    
+    elif command == "budget-init":
+        if result.get("initialized"):
+            print(f"💰 Budget INITIALIZED for '{result['task_id']}'")
+            print(f"   Max tokens: {result['max_tokens']:,}")
+        else:
+            print(f"❌ Budget init FAILED: {result.get('error')}")
+    
+    elif command == "budget-check":
+        if not result.get("initialized"):
+            print(f"❌ {result.get('error')}")
+        else:
+            usage = result.get("usage_percentage", 0)
+            status = result.get("status", "UNKNOWN")
+            
+            if status == "EXHAUSTED":
+                icon = "🛑"
+            elif status == "WARNING":
+                icon = "⚠️"
+            else:
+                icon = "💰"
+            
+            print(f"{icon} Budget Status: {status}")
+            print(f"   Task: {result['task_id']}")
+            print(f"   Used: {result['used_tokens']:,} / {result['max_tokens']:,} tokens")
+            print(f"   Remaining: {result['remaining_tokens']:,} tokens")
+            print(f"   Usage: {usage:.1f}%")
+            
+            # Progress bar
+            bar_width = 30
+            filled = int(bar_width * usage / 100)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            print(f"   [{bar}]")
+            
+            if not result.get("can_continue"):
+                print("   🚫 Cannot continue - budget exhausted!")
+    
+    elif command == "budget-spend":
+        if result.get("blocked"):
+            print("🛑 SAFETY SHUTDOWN TRIGGERED")
+            print(f"   {result.get('message')}")
+            print(f"   → {result.get('action_required')}")
+        elif result.get("allowed"):
+            print(f"💸 Spent {result['tokens_spent']:,} tokens")
+            print(f"   Reason: {result['reason']}")
+            print(f"   Remaining: {result['remaining_tokens']:,} tokens ({100 - result['usage_percentage']:.1f}%)")
+            if result.get("warning"):
+                print(f"   {result['warning']}")
+        else:
+            print(f"❌ Spend failed: {result.get('error')}")
+    
+    elif command == "budget-report":
+        if result.get("error"):
+            print(f"❌ {result['error']}")
+        else:
+            summary = result.get("summary", {})
+            print(f"📊 Budget Report: {result['task_id']}")
+            print(f"   Total Budget: {summary.get('max_tokens', 0):,} tokens")
+            print(f"   Used: {summary.get('used_tokens', 0):,} ({summary.get('usage_percentage', 0):.1f}%)")
+            print(f"   Remaining: {summary.get('remaining_tokens', 0):,}")
+            
+            by_op = result.get("by_operation", {})
+            if by_op:
+                print("\n   By Operation:")
+                for op, tokens in sorted(by_op.items(), key=lambda x: -x[1]):
+                    print(f"     • {op}: {tokens:,} tokens")
+            
+            by_agent = result.get("by_agent", {})
+            if by_agent:
+                print("\n   By Agent:")
+                for agent, tokens in sorted(by_agent.items(), key=lambda x: -x[1]):
+                    print(f"     • {agent}: {tokens:,} tokens")
 
 
 if __name__ == "__main__":

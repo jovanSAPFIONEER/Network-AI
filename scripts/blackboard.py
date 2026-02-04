@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Shared Blackboard - Agent Coordination State Manager
+Shared Blackboard - Agent Coordination State Manager (Atomic Commit Edition)
 
 A markdown-based shared state system for multi-agent coordination.
 Stores key-value pairs with optional TTL (time-to-live) expiration.
+
+FEATURES:
+  - File Locking: Prevents race conditions in multi-agent environments
+  - Staging Area: propose → validate → commit workflow
+  - Atomic Commits: Changes are all-or-nothing
 
 Usage:
     python blackboard.py write KEY VALUE [--ttl SECONDS]
@@ -11,32 +16,149 @@ Usage:
     python blackboard.py delete KEY
     python blackboard.py list
     python blackboard.py snapshot
+    
+    # Atomic commit workflow:
+    python blackboard.py propose CHANGE_ID KEY VALUE [--ttl SECONDS]
+    python blackboard.py validate CHANGE_ID
+    python blackboard.py commit CHANGE_ID
+    python blackboard.py abort CHANGE_ID
+    python blackboard.py list-pending
 
 Examples:
     python blackboard.py write "task:analysis" '{"status": "running"}'
     python blackboard.py write "cache:data" '{"value": 123}' --ttl 3600
     python blackboard.py read "task:analysis"
     python blackboard.py list
+    
+    # Safe multi-agent update:
+    python blackboard.py propose "chg_001" "order:123" '{"status": "approved"}'
+    python blackboard.py validate "chg_001"  # Orchestrator checks for conflicts
+    python blackboard.py commit "chg_001"    # Apply atomically
 """
 
 import argparse
 import json
+import os
 import re
 import sys
+import time
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from contextlib import contextmanager
+
+# Try to import fcntl (Unix only), fall back to file-based locking on Windows
+_fcntl: Any = None
+try:
+    import fcntl as _fcntl_import
+    _fcntl = _fcntl_import
+except ImportError:
+    pass
 
 # Default blackboard location
 BLACKBOARD_PATH = Path(__file__).parent.parent / "swarm-blackboard.md"
+LOCK_PATH = Path(__file__).parent.parent / "data" / ".blackboard.lock"
+PENDING_DIR = Path(__file__).parent.parent / "data" / "pending_changes"
+
+# Lock timeout settings
+LOCK_TIMEOUT_SECONDS = 10
+LOCK_RETRY_INTERVAL = 0.1
+
+
+class FileLock:
+    """
+    Cross-platform file lock for preventing race conditions.
+    Uses fcntl on Unix, fallback to lock file on Windows.
+    """
+    
+    def __init__(self, lock_path: Path, timeout: float = LOCK_TIMEOUT_SECONDS):
+        self.lock_path = lock_path
+        self.timeout = timeout
+        self.lock_file: Optional[Any] = None
+        self.lock_marker: Optional[Path] = None
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    def acquire(self) -> bool:
+        """Acquire the lock with timeout."""
+        start_time = time.time()
+        
+        while True:
+            try:
+                self.lock_file = open(self.lock_path, 'w')
+                
+                if _fcntl is not None:
+                    # Unix/Linux/Mac - use fcntl
+                    _fcntl.flock(self.lock_file.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                else:
+                    # Windows fallback: use lock marker file
+                    self.lock_marker = self.lock_path.with_suffix('.locked')
+                    if self.lock_marker.exists():
+                        # Check if stale (older than timeout)
+                        age = time.time() - self.lock_marker.stat().st_mtime
+                        if age < self.timeout:
+                            self.lock_file.close()
+                            raise BlockingIOError("Lock held by another process")
+                        # Stale lock, remove it
+                        self.lock_marker.unlink()
+                    self.lock_marker.write_text(str(time.time()))
+                
+                # Write lock holder info
+                self.lock_file.write(json.dumps({
+                    "pid": os.getpid(),
+                    "acquired_at": datetime.now(timezone.utc).isoformat()
+                }))
+                self.lock_file.flush()
+                return True
+                
+            except (BlockingIOError, OSError):
+                if self.lock_file:
+                    self.lock_file.close()
+                    self.lock_file = None
+                if time.time() - start_time > self.timeout:
+                    return False
+                time.sleep(LOCK_RETRY_INTERVAL)
+    
+    def release(self) -> None:
+        """Release the lock."""
+        if self.lock_file:
+            try:
+                if _fcntl is not None:
+                    _fcntl.flock(self.lock_file.fileno(), _fcntl.LOCK_UN)
+                elif self.lock_marker and self.lock_marker.exists():
+                    self.lock_marker.unlink()
+                
+                self.lock_file.close()
+            except Exception:
+                pass
+            finally:
+                self.lock_file = None
+                self.lock_marker = None
+
+
+@contextmanager
+def blackboard_lock(lock_path: Path = LOCK_PATH):
+    """Context manager for atomic blackboard access."""
+    lock = FileLock(lock_path)
+    if not lock.acquire():
+        raise TimeoutError(
+            f"Could not acquire blackboard lock within {LOCK_TIMEOUT_SECONDS}s. "
+            "Another agent may be holding it. Retry later."
+        )
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class SharedBlackboard:
-    """Markdown-based shared state for agent coordination."""
+    """Markdown-based shared state for agent coordination with atomic commits."""
     
     def __init__(self, path: Path = BLACKBOARD_PATH):
         self.path = path
         self.cache: dict[str, dict[str, Any]] = {}
+        self.pending_dir = PENDING_DIR
+        self.pending_dir.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self._load_from_disk()
     
@@ -155,7 +277,7 @@ Last Updated: {datetime.now(timezone.utc).isoformat()}
     
     def write(self, key: str, value: Any, source_agent: str = "unknown", 
               ttl: Optional[int] = None) -> dict[str, Any]:
-        """Write an entry to the blackboard."""
+        """Write an entry to the blackboard (with file locking)."""
         entry: dict[str, Any] = {
             "key": key,
             "value": value,
@@ -164,17 +286,257 @@ Last Updated: {datetime.now(timezone.utc).isoformat()}
             "ttl": ttl,
         }
         
-        self.cache[key] = entry
-        self._persist_to_disk()
+        with blackboard_lock():
+            # Reload to get latest state
+            self._load_from_disk()
+            self.cache[key] = entry
+            self._persist_to_disk()
+        
         return entry
     
     def delete(self, key: str) -> bool:
-        """Delete an entry from the blackboard."""
-        if key in self.cache:
-            del self.cache[key]
-            self._persist_to_disk()
-            return True
+        """Delete an entry from the blackboard (with file locking)."""
+        with blackboard_lock():
+            self._load_from_disk()
+            if key in self.cache:
+                del self.cache[key]
+                self._persist_to_disk()
+                return True
         return False
+    
+    # ========================================================================
+    # ATOMIC COMMIT WORKFLOW: propose → validate → commit
+    # ========================================================================
+    
+    def propose_change(self, change_id: str, key: str, value: Any, 
+                       source_agent: str = "unknown", ttl: Optional[int] = None,
+                       operation: str = "write") -> dict[str, Any]:
+        """
+        Stage a change without applying it (Step 1 of atomic commit).
+        
+        The change is written to a .pending file and must be validated
+        and committed by the orchestrator before it takes effect.
+        """
+        pending_file = self.pending_dir / f"{change_id}.pending.json"
+        
+        # Check for duplicate change_id
+        if pending_file.exists():
+            return {
+                "success": False,
+                "error": f"Change ID '{change_id}' already exists. Use a unique ID."
+            }
+        
+        # Get current value for conflict detection
+        current_entry = self.cache.get(key)
+        current_hash = None
+        if current_entry:
+            current_hash = hashlib.sha256(
+                json.dumps(current_entry, sort_keys=True).encode()
+            ).hexdigest()[:16]
+        
+        change_set: dict[str, Any] = {
+            "change_id": change_id,
+            "operation": operation,  # "write" or "delete"
+            "key": key,
+            "value": value,
+            "source_agent": source_agent,
+            "ttl": ttl,
+            "proposed_at": datetime.now(timezone.utc).isoformat(),
+            "status": "pending",
+            "base_hash": current_hash,  # For conflict detection
+        }
+        
+        pending_file.write_text(json.dumps(change_set, indent=2))
+        
+        return {
+            "success": True,
+            "change_id": change_id,
+            "status": "proposed",
+            "pending_file": str(pending_file),
+            "message": "Change staged. Run 'validate' then 'commit' to apply."
+        }
+    
+    def validate_change(self, change_id: str) -> dict[str, Any]:
+        """
+        Validate a pending change for conflicts (Step 2 of atomic commit).
+        
+        Checks:
+        - Change exists
+        - No conflicting changes to the same key
+        - Base hash matches (data hasn't changed since proposal)
+        """
+        pending_file = self.pending_dir / f"{change_id}.pending.json"
+        
+        if not pending_file.exists():
+            return {
+                "valid": False,
+                "error": f"Change '{change_id}' not found. Was it proposed?"
+            }
+        
+        change_set = json.loads(pending_file.read_text())
+        
+        if change_set["status"] != "pending":
+            return {
+                "valid": False,
+                "error": f"Change is in '{change_set['status']}' state, not 'pending'"
+            }
+        
+        key = change_set["key"]
+        base_hash = change_set["base_hash"]
+        
+        # Check for conflicts: has the key changed since we proposed?
+        with blackboard_lock():
+            self._load_from_disk()
+            current_entry = self.cache.get(key)
+        
+        current_hash = None
+        if current_entry:
+            current_hash = hashlib.sha256(
+                json.dumps(current_entry, sort_keys=True).encode()
+            ).hexdigest()[:16]
+        
+        if base_hash != current_hash:
+            return {
+                "valid": False,
+                "conflict": True,
+                "error": f"CONFLICT: Key '{key}' was modified since proposal. "
+                         f"Expected hash {base_hash}, got {current_hash}. "
+                         "Abort and re-propose with fresh data.",
+                "current_value": current_entry
+            }
+        
+        # Check for other pending changes to the same key
+        conflicts: list[str] = []
+        for other_file in self.pending_dir.glob("*.pending.json"):
+            if other_file.name == pending_file.name:
+                continue
+            other_change = json.loads(other_file.read_text())
+            if other_change["key"] == key and other_change["status"] == "pending":
+                conflicts.append(other_change["change_id"])
+        
+        if conflicts:
+            return {
+                "valid": False,
+                "conflict": True,
+                "error": f"CONFLICT: Other pending changes affect key '{key}': {conflicts}. "
+                         "Resolve conflicts before committing."
+            }
+        
+        # Mark as validated
+        change_set["status"] = "validated"
+        change_set["validated_at"] = datetime.now(timezone.utc).isoformat()
+        pending_file.write_text(json.dumps(change_set, indent=2))
+        
+        return {
+            "valid": True,
+            "change_id": change_id,
+            "key": key,
+            "status": "validated",
+            "message": "No conflicts detected. Ready to commit."
+        }
+    
+    def commit_change(self, change_id: str) -> dict[str, Any]:
+        """
+        Apply a validated change atomically (Step 3 of atomic commit).
+        """
+        pending_file = self.pending_dir / f"{change_id}.pending.json"
+        
+        if not pending_file.exists():
+            return {
+                "committed": False,
+                "error": f"Change '{change_id}' not found."
+            }
+        
+        change_set = json.loads(pending_file.read_text())
+        
+        if change_set["status"] != "validated":
+            return {
+                "committed": False,
+                "error": f"Change must be validated first. Current status: {change_set['status']}"
+            }
+        
+        # Apply the change atomically
+        with blackboard_lock():
+            self._load_from_disk()
+            
+            if change_set["operation"] == "delete":
+                if change_set["key"] in self.cache:
+                    del self.cache[change_set["key"]]
+            else:
+                entry: dict[str, Any] = {
+                    "key": change_set["key"],
+                    "value": change_set["value"],
+                    "source_agent": change_set["source_agent"],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "ttl": change_set["ttl"],
+                    "committed_from": change_id
+                }
+                self.cache[change_set["key"]] = entry
+            
+            self._persist_to_disk()
+        
+        # Archive the committed change
+        change_set["status"] = "committed"
+        change_set["committed_at"] = datetime.now(timezone.utc).isoformat()
+        
+        archive_dir = self.pending_dir / "archive"
+        archive_dir.mkdir(exist_ok=True)
+        archive_file = archive_dir / f"{change_id}.committed.json"
+        archive_file.write_text(json.dumps(change_set, indent=2))
+        
+        # Remove pending file
+        pending_file.unlink()
+        
+        return {
+            "committed": True,
+            "change_id": change_id,
+            "key": change_set["key"],
+            "operation": change_set["operation"],
+            "message": "Change committed atomically."
+        }
+    
+    def abort_change(self, change_id: str) -> dict[str, Any]:
+        """Abort a pending change without applying it."""
+        pending_file = self.pending_dir / f"{change_id}.pending.json"
+        
+        if not pending_file.exists():
+            return {
+                "aborted": False,
+                "error": f"Change '{change_id}' not found."
+            }
+        
+        change_set = json.loads(pending_file.read_text())
+        change_set["status"] = "aborted"
+        change_set["aborted_at"] = datetime.now(timezone.utc).isoformat()
+        
+        # Archive the aborted change
+        archive_dir = self.pending_dir / "archive"
+        archive_dir.mkdir(exist_ok=True)
+        archive_file = archive_dir / f"{change_id}.aborted.json"
+        archive_file.write_text(json.dumps(change_set, indent=2))
+        
+        pending_file.unlink()
+        
+        return {
+            "aborted": True,
+            "change_id": change_id,
+            "key": change_set["key"]
+        }
+    
+    def list_pending_changes(self) -> list[dict[str, Any]]:
+        """List all pending changes awaiting commit."""
+        pending: list[dict[str, Any]] = []
+        for pending_file in self.pending_dir.glob("*.pending.json"):
+            change_set = json.loads(pending_file.read_text())
+            pending.append({
+                "change_id": change_set["change_id"],
+                "key": change_set["key"],
+                "operation": change_set["operation"],
+                "source_agent": change_set["source_agent"],
+                "status": change_set["status"],
+                "proposed_at": change_set["proposed_at"]
+            })
+        return pending
     
     def exists(self, key: str) -> bool:
         """Check if a key exists (and is not expired)."""
@@ -200,49 +562,59 @@ Last Updated: {datetime.now(timezone.utc).isoformat()}
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Shared Blackboard - Agent Coordination State Manager",
+        description="Shared Blackboard - Agent Coordination State Manager (Atomic Commit Edition)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  write KEY VALUE [--ttl SECONDS]  Write a value (JSON) with optional TTL
-  read KEY                         Read a value
-  delete KEY                       Delete a key
-  list                             List all keys
-  snapshot                         Get full snapshot as JSON
+  write KEY VALUE [--ttl SECONDS]     Write a value (with file locking)
+  read KEY                            Read a value
+  delete KEY                          Delete a key
+  list                                List all keys
+  snapshot                            Get full snapshot as JSON
+
+Atomic Commit Workflow (for multi-agent safety):
+  propose CHANGE_ID KEY VALUE         Stage a change (Step 1)
+  validate CHANGE_ID                  Check for conflicts (Step 2)
+  commit CHANGE_ID                    Apply atomically (Step 3)
+  abort CHANGE_ID                     Cancel a pending change
+  list-pending                        Show all pending changes
 
 Examples:
-  %(prog)s write "task:analysis" '{"status": "running", "agent": "data_analyst"}'
+  %(prog)s write "task:analysis" '{"status": "running"}'
   %(prog)s write "cache:temp" '{"data": [1,2,3]}' --ttl 3600
-  %(prog)s read "task:analysis"
-  %(prog)s list
-  %(prog)s snapshot
+  
+  # Safe multi-agent update:
+  %(prog)s propose "chg_001" "order:123" '{"status": "approved"}'
+  %(prog)s validate "chg_001"
+  %(prog)s commit "chg_001"
 """
     )
     
     parser.add_argument(
         "command",
-        choices=["write", "read", "delete", "list", "snapshot"],
+        choices=["write", "read", "delete", "list", "snapshot", 
+                 "propose", "validate", "commit", "abort", "list-pending"],
         help="Command to execute"
     )
     parser.add_argument(
         "key",
         nargs="?",
-        help="Key name (required for write/read/delete)"
+        help="Key name or Change ID (depending on command)"
     )
     parser.add_argument(
         "value",
         nargs="?",
-        help="JSON value (required for write)"
+        help="JSON value (required for write/propose)"
     )
     parser.add_argument(
         "--ttl",
         type=int,
-        help="Time-to-live in seconds (for write)"
+        help="Time-to-live in seconds (for write/propose)"
     )
     parser.add_argument(
         "--agent",
         default="cli",
-        help="Source agent ID (for write)"
+        help="Source agent ID (for write/propose)"
     )
     parser.add_argument(
         "--json",
@@ -259,79 +631,188 @@ Examples:
     args = parser.parse_args()
     bb = SharedBlackboard(args.path)
     
-    if args.command == "write":
-        if not args.key or not args.value:
-            print("Error: write requires KEY and VALUE", file=sys.stderr)
-            sys.exit(1)
-        
-        try:
-            value = json.loads(args.value)
-        except json.JSONDecodeError:
-            # Treat as string if not valid JSON
-            value = args.value
-        
-        entry = bb.write(args.key, value, args.agent, args.ttl)
-        
-        if args.json:
-            print(json.dumps(entry, indent=2))
-        else:
-            print(f"✅ Written: {args.key}")
-            if args.ttl:
-                print(f"   TTL: {args.ttl} seconds")
-    
-    elif args.command == "read":
-        if not args.key:
-            print("Error: read requires KEY", file=sys.stderr)
-            sys.exit(1)
-        
-        entry = bb.read(args.key)
-        
-        if entry is None:
+    try:
+        if args.command == "write":
+            if not args.key or not args.value:
+                print("Error: write requires KEY and VALUE", file=sys.stderr)
+                sys.exit(1)
+            
+            try:
+                value = json.loads(args.value)
+            except json.JSONDecodeError:
+                value = args.value
+            
+            entry = bb.write(args.key, value, args.agent, args.ttl)
+            
             if args.json:
-                print("null")
+                print(json.dumps(entry, indent=2))
             else:
-                print(f"❌ Key not found or expired: {args.key}")
-            sys.exit(1)
+                print(f"✅ Written: {args.key} (with lock)")
+                if args.ttl:
+                    print(f"   TTL: {args.ttl} seconds")
         
-        if args.json:
-            print(json.dumps(entry, indent=2))
-        else:
-            print(f"📖 {args.key}:")
-            print(f"   Value: {json.dumps(entry.get('value'))}")
-            print(f"   Source: {entry.get('source_agent')}")
-            print(f"   Timestamp: {entry.get('timestamp')}")
-            if entry.get('ttl'):
-                print(f"   TTL: {entry['ttl']} seconds")
-    
-    elif args.command == "delete":
-        if not args.key:
-            print("Error: delete requires KEY", file=sys.stderr)
-            sys.exit(1)
-        
-        if bb.delete(args.key):
-            print(f"✅ Deleted: {args.key}")
-        else:
-            print(f"❌ Key not found: {args.key}")
-            sys.exit(1)
-    
-    elif args.command == "list":
-        keys = bb.list_keys()
-        
-        if args.json:
-            print(json.dumps(keys, indent=2))
-        else:
-            if keys:
-                print(f"📋 Blackboard keys ({len(keys)}):")
-                for key in sorted(keys):
-                    entry = bb.read(key)
-                    ttl_info = f" [TTL: {entry['ttl']}s]" if entry and entry.get('ttl') else ""
-                    print(f"   • {key}{ttl_info}")
+        elif args.command == "read":
+            if not args.key:
+                print("Error: read requires KEY", file=sys.stderr)
+                sys.exit(1)
+            
+            entry = bb.read(args.key)
+            
+            if entry is None:
+                if args.json:
+                    print("null")
+                else:
+                    print(f"❌ Key not found or expired: {args.key}")
+                sys.exit(1)
+            
+            if args.json:
+                print(json.dumps(entry, indent=2))
             else:
-                print("📋 Blackboard is empty")
+                print(f"📖 {args.key}:")
+                print(f"   Value: {json.dumps(entry.get('value'))}")
+                print(f"   Source: {entry.get('source_agent')}")
+                print(f"   Timestamp: {entry.get('timestamp')}")
+                if entry.get('ttl'):
+                    print(f"   TTL: {entry['ttl']} seconds")
+        
+        elif args.command == "delete":
+            if not args.key:
+                print("Error: delete requires KEY", file=sys.stderr)
+                sys.exit(1)
+            
+            if bb.delete(args.key):
+                print(f"✅ Deleted: {args.key}")
+            else:
+                print(f"❌ Key not found: {args.key}")
+                sys.exit(1)
+        
+        elif args.command == "list":
+            keys = bb.list_keys()
+            
+            if args.json:
+                print(json.dumps(keys, indent=2))
+            else:
+                if keys:
+                    print(f"📋 Blackboard keys ({len(keys)}):")
+                    for key in sorted(keys):
+                        entry = bb.read(key)
+                        ttl_info = f" [TTL: {entry['ttl']}s]" if entry and entry.get('ttl') else ""
+                        print(f"   • {key}{ttl_info}")
+                else:
+                    print("📋 Blackboard is empty")
+        
+        elif args.command == "snapshot":
+            snapshot = bb.get_snapshot()
+            print(json.dumps(snapshot, indent=2))
+        
+        # === ATOMIC COMMIT COMMANDS ===
+        
+        elif args.command == "propose":
+            if not args.key or not args.value:
+                print("Error: propose requires CHANGE_ID and KEY VALUE", file=sys.stderr)
+                print("Usage: propose CHANGE_ID KEY VALUE", file=sys.stderr)
+                sys.exit(1)
+            
+            # Parse: propose CHANGE_ID KEY VALUE (key is actually change_id, value is "KEY VALUE")
+            parts = args.value.split(" ", 1)
+            if len(parts) < 2:
+                print("Error: propose requires CHANGE_ID KEY VALUE", file=sys.stderr)
+                sys.exit(1)
+            
+            change_id = args.key
+            actual_key = parts[0]
+            actual_value_str = parts[1] if len(parts) > 1 else "{}"
+            
+            try:
+                actual_value = json.loads(actual_value_str)
+            except json.JSONDecodeError:
+                actual_value = actual_value_str
+            
+            result = bb.propose_change(change_id, actual_key, actual_value, args.agent, args.ttl)
+            
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                if result["success"]:
+                    print(f"📝 Change PROPOSED: {change_id}")
+                    print(f"   Key: {actual_key}")
+                    print(f"   Status: pending validation")
+                    print(f"   Next: run 'validate {change_id}'")
+                else:
+                    print(f"❌ Proposal FAILED: {result['error']}")
+                    sys.exit(1)
+        
+        elif args.command == "validate":
+            if not args.key:
+                print("Error: validate requires CHANGE_ID", file=sys.stderr)
+                sys.exit(1)
+            
+            result = bb.validate_change(args.key)
+            
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                if result["valid"]:
+                    print(f"✅ Change VALIDATED: {args.key}")
+                    print(f"   Key: {result['key']}")
+                    print(f"   No conflicts detected")
+                    print(f"   Next: run 'commit {args.key}'")
+                else:
+                    print(f"❌ Validation FAILED: {result['error']}")
+                    sys.exit(1)
+        
+        elif args.command == "commit":
+            if not args.key:
+                print("Error: commit requires CHANGE_ID", file=sys.stderr)
+                sys.exit(1)
+            
+            result = bb.commit_change(args.key)
+            
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                if result["committed"]:
+                    print(f"🎉 Change COMMITTED: {args.key}")
+                    print(f"   Key: {result['key']}")
+                    print(f"   Operation: {result['operation']}")
+                else:
+                    print(f"❌ Commit FAILED: {result['error']}")
+                    sys.exit(1)
+        
+        elif args.command == "abort":
+            if not args.key:
+                print("Error: abort requires CHANGE_ID", file=sys.stderr)
+                sys.exit(1)
+            
+            result = bb.abort_change(args.key)
+            
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                if result["aborted"]:
+                    print(f"🚫 Change ABORTED: {args.key}")
+                else:
+                    print(f"❌ Abort FAILED: {result['error']}")
+                    sys.exit(1)
+        
+        elif args.command == "list-pending":
+            pending = bb.list_pending_changes()
+            
+            if args.json:
+                print(json.dumps(pending, indent=2))
+            else:
+                if pending:
+                    print(f"📋 Pending changes ({len(pending)}):")
+                    for p in pending:
+                        status_icon = "🟡" if p["status"] == "pending" else "🟢"
+                        print(f"   {status_icon} {p['change_id']}: {p['operation']} '{p['key']}'")
+                        print(f"      Agent: {p['source_agent']} | Status: {p['status']}")
+                else:
+                    print("📋 No pending changes")
     
-    elif args.command == "snapshot":
-        snapshot = bb.get_snapshot()
-        print(json.dumps(snapshot, indent=2))
+    except TimeoutError as e:
+        print(f"🔒 LOCK TIMEOUT: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

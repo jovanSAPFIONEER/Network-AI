@@ -1,5 +1,5 @@
 # Swarm Blackboard
-Last Updated: 2026-02-04T14:14:20.545725Z
+Last Updated: 2026-02-04T15:04:32.804181+00:00
 
 ## Active Tasks
 | TaskID | Agent | Status | Started | Description |
@@ -95,22 +95,6 @@ Last Updated: 2026-02-04T14:14:20.545725Z
   "ttl": null
 }
 
-### task:DataAnalyst:result
-{
-  "key": "task:DataAnalyst:result",
-  "value": {
-    "revenue": 15000000,
-    "expenses": 8500000,
-    "netIncome": 6500000,
-    "growth": 12.5,
-    "analyzedBy": "DataAnalyst",
-    "timestamp": "2026-02-04T13:57:26.504Z"
-  },
-  "sourceAgent": "DataAnalyst",
-  "timestamp": "2026-02-04T13:57:26.504Z",
-  "ttl": 3600
-}
-
 ### task:financial_analysis:q3
 {
   "key": "task:financial_analysis:q3",
@@ -186,53 +170,31 @@ Last Updated: 2026-02-04T14:14:20.545725Z
   "ttl": null
 }
 
-### synthesis:budget_analysis:final
-{
-  "key": "synthesis:budget_analysis:final",
-  "value": {
-    "merged": true,
-    "contributions": [
-      {
-        "source": "DataAnalyst",
-        "data": {
-          "metrics": {
-            "revenue": 15000000,
-            "costs": 8500000
-          }
-        }
-      },
-      {
-        "source": "StrategyAdvisor",
-        "data": {
-          "scenarios": [
-            "conservative",
-            "moderate",
-            "aggressive"
-          ]
-        }
-      },
-      {
-        "source": "RiskAssessor",
-        "data": {
-          "riskLevel": "medium",
-          "confidence": 0.82
-        }
-      }
-    ],
-    "summary": "Synthesized from 3 agents",
-    "totalExecutionTime": 386
-  },
-  "sourceAgent": "orchestrator",
-  "timestamp": "2026-02-04T13:57:26.901Z",
-  "ttl": 3600
-}
-
 ### task:test_q4
 {
   "key": "task:test_q4",
   "value": "{status: in_progress, agent: data_analyst}",
   "source_agent": "cli",
   "timestamp": "2026-02-04T14:14:20.545315Z",
+  "ttl": null
+}
+
+### order:123
+{
+  "key": "order:123",
+  "value": "{status: pending, customer: ACME}",
+  "source_agent": "cli",
+  "timestamp": "2026-02-04T15:02:52.507177+00:00",
+  "ttl": null,
+  "committed_from": "chg_001"
+}
+
+### test:atomic
+{
+  "key": "test:atomic",
+  "value": "{status: testing}",
+  "source_agent": "cli",
+  "timestamp": "2026-02-04T15:04:32.800154+00:00",
   "ttl": null
 }
 
