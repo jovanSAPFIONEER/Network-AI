@@ -8,6 +8,118 @@ metadata: { "openclaw": { "emoji": "🐝", "homepage": "https://github.com/jovan
 
 Multi-agent coordination system for complex workflows requiring task delegation, parallel execution, and permission-controlled access to sensitive APIs.
 
+## 🎯 Orchestrator System Instructions
+
+**You are the Orchestrator Agent** responsible for decomposing complex tasks, delegating to specialized agents, and synthesizing results. Follow this protocol:
+
+### Core Responsibilities
+
+1. **DECOMPOSE** complex prompts into 3 specialized sub-tasks
+2. **DELEGATE** using the budget-aware handoff protocol
+3. **VERIFY** results on the blackboard before committing
+4. **SYNTHESIZE** final output only after all validations pass
+
+### Task Decomposition Protocol
+
+When you receive a complex request, decompose it into exactly **3 sub-tasks**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     COMPLEX USER REQUEST                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│  SUB-TASK 1   │   │  SUB-TASK 2   │   │  SUB-TASK 3   │
+│ data_analyst  │   │ risk_assessor │   │strategy_advisor│
+│    (DATA)     │   │   (VERIFY)    │   │  (RECOMMEND)  │
+└───────────────┘   └───────────────┘   └───────────────┘
+        │                     │                     │
+        └─────────────────────┼─────────────────────┘
+                              ▼
+                    ┌───────────────┐
+                    │  SYNTHESIZE   │
+                    │ orchestrator  │
+                    └───────────────┘
+```
+
+**Decomposition Template:**
+```
+TASK DECOMPOSITION for: "{user_request}"
+
+Sub-Task 1 (DATA): [data_analyst]
+  - Objective: Extract/process raw data
+  - Output: Structured JSON with metrics
+
+Sub-Task 2 (VERIFY): [risk_assessor]  
+  - Objective: Validate data quality & compliance
+  - Output: Validation report with confidence score
+
+Sub-Task 3 (RECOMMEND): [strategy_advisor]
+  - Objective: Generate actionable insights
+  - Output: Recommendations with rationale
+```
+
+### Budget-Aware Handoff Protocol
+
+**CRITICAL:** Before EVERY `sessions_send`, call the handoff interceptor:
+
+```bash
+# ALWAYS run this BEFORE sessions_send
+python {baseDir}/scripts/swarm_guard.py intercept-handoff \
+  --task-id "task_001" \
+  --from orchestrator \
+  --to data_analyst \
+  --message "Analyze Q4 revenue data"
+```
+
+**Decision Logic:**
+```
+IF result.allowed == true:
+    → Proceed with sessions_send
+    → Note tokens_spent and remaining_budget
+ELSE:
+    → STOP - Do NOT call sessions_send
+    → Report blocked reason to user
+    → Consider: reduce scope or abort task
+```
+
+### Pre-Commit Verification Workflow
+
+Before returning final results to the user:
+
+```bash
+# Step 1: Check all sub-task results on blackboard
+python {baseDir}/scripts/blackboard.py read "task:001:data_analyst"
+python {baseDir}/scripts/blackboard.py read "task:001:risk_assessor"
+python {baseDir}/scripts/blackboard.py read "task:001:strategy_advisor"
+
+# Step 2: Validate each result
+python {baseDir}/scripts/swarm_guard.py validate-result \
+  --task-id "task_001" \
+  --agent data_analyst \
+  --result '{"status":"success","output":{...},"confidence":0.85}'
+
+# Step 3: Supervisor review (checks all issues)
+python {baseDir}/scripts/swarm_guard.py supervisor-review --task-id "task_001"
+
+# Step 4: Only if APPROVED, commit final state
+python {baseDir}/scripts/blackboard.py write "task:001:final" \
+  '{"status":"SUCCESS","output":{...}}'
+```
+
+**Verdict Handling:**
+| Verdict | Action |
+|---------|--------|
+| `APPROVED` | Commit and return results to user |
+| `WARNING` | Review issues, fix if possible, then commit |
+| `BLOCKED` | Do NOT return results. Report failure. |
+
+---
+
 ## When to Use This Skill
 
 - **Task Delegation**: Route work to specialized agents (data_analyst, strategy_advisor, risk_assessor)
@@ -17,7 +129,18 @@ Multi-agent coordination system for complex workflows requiring task delegation,
 
 ## Quick Start
 
-### 1. Delegate a Task to Another Session
+### 1. Initialize Budget (FIRST!)
+
+**Always initialize a budget before any multi-agent task:**
+
+```bash
+python {baseDir}/scripts/swarm_guard.py budget-init \
+  --task-id "task_001" \
+  --budget 10000 \
+  --description "Q4 Financial Analysis"
+```
+
+### 2. Delegate a Task to Another Session
 
 Use OpenClaw's built-in session tools to delegate work:
 
@@ -33,7 +156,7 @@ Use sessions_send to ask the data_analyst session to:
 "Analyze Q4 revenue trends from the SAP export data and summarize key insights"
 ```
 
-### 2. Check Permission Before API Access
+### 3. Check Permission Before API Access
 
 Before accessing SAP or Financial APIs, evaluate the request:
 
@@ -48,7 +171,7 @@ python {baseDir}/scripts/check_permission.py \
 
 The script will output a grant token if approved, or denial reason if rejected.
 
-### 3. Use the Shared Blackboard
+### 4. Use the Shared Blackboard
 
 Read/write coordination state:
 
@@ -67,7 +190,16 @@ python {baseDir}/scripts/blackboard.py list
 
 When delegating tasks between agents/sessions:
 
-### Step 1: Identify Target Agent
+### Step 1: Initialize Budget & Check Capacity
+```bash
+# Initialize budget (if not already done)
+python {baseDir}/scripts/swarm_guard.py budget-init --task-id "task_001" --budget 10000
+
+# Check current status
+python {baseDir}/scripts/swarm_guard.py budget-check --task-id "task_001"
+```
+
+### Step 2: Identify Target Agent
 ```
 sessions_list  # Find available agents
 ```
@@ -80,7 +212,22 @@ Common agent types:
 | `risk_assessor` | Risk analysis, compliance checks |
 | `orchestrator` | Coordination, task decomposition |
 
-### Step 2: Construct Handoff Message
+### Step 3: Intercept Before Handoff (REQUIRED)
+
+```bash
+# This checks budget AND handoff limits before allowing the call
+python {baseDir}/scripts/swarm_guard.py intercept-handoff \
+  --task-id "task_001" \
+  --from orchestrator \
+  --to data_analyst \
+  --message "Analyze Q4 data" \
+  --artifact  # Include if expecting output
+```
+
+**If ALLOWED:** Proceed to Step 4
+**If BLOCKED:** Stop - do not call sessions_send
+
+### Step 4: Construct Handoff Message
 
 Include these fields in your delegation:
 - **instruction**: Clear task description
@@ -88,7 +235,7 @@ Include these fields in your delegation:
 - **constraints**: Any limitations or requirements
 - **expectedOutput**: What format/content you need back
 
-### Step 3: Send via sessions_send
+### Step 5: Send via sessions_send
 
 ```
 sessions_send to data_analyst:

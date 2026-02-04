@@ -703,6 +703,118 @@ class SwarmGuard:
             "created_at": budget["created_at"]
         }
 
+    # ========================================================================
+    # SESSIONS_SEND INTERCEPTION (Budget-Aware Handoff)
+    # ========================================================================
+
+    def intercept_handoff(self, task_id: str, from_agent: str, to_agent: str,
+                          message: str, has_artifact: bool = False) -> dict[str, Any]:
+        """
+        INTERCEPT every sessions_send call to:
+        1. Check budget before allowing handoff
+        2. Deduct handoff tax automatically
+        3. Record the handoff for tracking
+        4. Block if budget exceeded or too many handoffs
+        
+        This is the MAIN entry point that should wrap every sessions_send.
+        
+        Usage (in orchestrator code):
+            result = guard.intercept_handoff(task_id, "orchestrator", "analyst", message)
+            if result["allowed"]:
+                sessions_send(to_agent, message)  # Proceed with actual handoff
+            else:
+                # Handle blocked handoff
+        """
+        result: dict[str, Any] = {
+            "allowed": False,
+            "task_id": task_id,
+            "from_agent": from_agent,
+            "to_agent": to_agent
+        }
+        
+        # Step 1: Check if budget exists (initialize if not)
+        budget_status = self.check_budget(task_id)
+        if not budget_status.get("initialized"):
+            # Auto-initialize with default budget for convenience
+            self.init_budget(task_id, DEFAULT_MAX_TOKEN_BUDGET, 
+                           f"Auto-initialized for handoff from {from_agent}")
+            budget_status = self.check_budget(task_id)
+        
+        # Step 2: Check if we can continue (budget not exhausted)
+        if not budget_status.get("can_continue"):
+            result["blocked"] = True
+            result["reason"] = "BUDGET_EXHAUSTED"
+            result["message"] = f"🛑 Cannot handoff: budget exhausted for task '{task_id}'"
+            result["budget_status"] = budget_status
+            
+            log_audit("handoff_blocked", {
+                "task_id": task_id,
+                "from": from_agent,
+                "to": to_agent,
+                "reason": "budget_exhausted"
+            })
+            
+            return result
+        
+        # Step 3: Calculate handoff cost
+        base_cost = TOKEN_COSTS["handoff"]
+        message_cost = len(message) // 4  # ~4 chars per token
+        total_cost = base_cost + message_cost
+        
+        # Step 4: Deduct from budget
+        spend_result = self.spend_budget(
+            task_id, 
+            total_cost,
+            f"Handoff: {from_agent} → {to_agent}",
+            from_agent,
+            "handoff"
+        )
+        
+        if spend_result.get("blocked"):
+            result["blocked"] = True
+            result["reason"] = "BUDGET_EXCEEDED"
+            result["message"] = spend_result.get("message")
+            result["spend_result"] = spend_result
+            return result
+        
+        # Step 5: Record the handoff (checks handoff tax limits)
+        handoff_result = self.record_handoff(
+            task_id, from_agent, to_agent, message, has_artifact
+        )
+        
+        if handoff_result.get("blocked"):
+            result["blocked"] = True
+            result["reason"] = "HANDOFF_TAX_EXCEEDED"
+            result["message"] = f"🛑 Handoff blocked: {handoff_result['violations']}"
+            result["handoff_result"] = handoff_result
+            return result
+        
+        # Step 6: All checks passed - handoff is allowed
+        result["allowed"] = True
+        result["tokens_spent"] = total_cost
+        result["remaining_budget"] = spend_result.get("remaining_tokens")
+        result["handoff_number"] = handoff_result.get("handoff_number")
+        result["remaining_handoffs"] = handoff_result.get("remaining", 0)
+        
+        warnings: list[str] = []
+        if spend_result.get("warning"):
+            warnings.append(str(spend_result["warning"]))
+        
+        if handoff_result.get("warnings"):
+            warnings.extend([str(w) for w in handoff_result["warnings"]])
+        
+        result["warnings"] = warnings
+        
+        log_audit("handoff_allowed", {
+            "task_id": task_id,
+            "from": from_agent,
+            "to": to_agent,
+            "tokens_spent": total_cost,
+            "handoff_number": handoff_result.get("handoff_number")
+        })
+        
+        return result
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -712,6 +824,7 @@ def main():
 Commands:
   check-handoff      Check handoff tax status for a task
   record-handoff     Record a new handoff (with tax checking)
+  intercept-handoff  BUDGET-AWARE handoff (wraps sessions_send)
   validate-result    Validate an agent's result before propagation
   health-check       Check if an agent is healthy
   heartbeat          Record agent heartbeat
@@ -726,6 +839,7 @@ Commands:
 Examples:
   %(prog)s check-handoff --task-id "task_001"
   %(prog)s record-handoff --task-id "task_001" --from orchestrator --to analyst --message "Analyze data"
+  %(prog)s intercept-handoff --task-id "task_001" --from orchestrator --to analyst --message "Analyze data"
   %(prog)s validate-result --task-id "task_001" --agent analyst --result '{"status":"ok","output":"...","confidence":0.9}'
   %(prog)s health-check --agent data_analyst
   
@@ -737,7 +851,7 @@ Examples:
     )
     
     parser.add_argument("command", choices=[
-        "check-handoff", "record-handoff", "validate-result",
+        "check-handoff", "record-handoff", "intercept-handoff", "validate-result",
         "health-check", "heartbeat", "supervisor-review",
         "budget-init", "budget-check", "budget-spend", "budget-report"
     ])
@@ -771,6 +885,15 @@ Examples:
             print("Error: --task-id, --from, --to, --message required", file=sys.stderr)
             sys.exit(1)
         result = guard.record_handoff(
+            args.task_id, args.from_agent, args.to_agent, 
+            args.message, args.artifact
+        )
+    
+    elif args.command == "intercept-handoff":
+        if not all([args.task_id, args.from_agent, args.to_agent, args.message]):
+            print("Error: --task-id, --from, --to, --message required", file=sys.stderr)
+            sys.exit(1)
+        result = guard.intercept_handoff(
             args.task_id, args.from_agent, args.to_agent, 
             args.message, args.artifact
         )
@@ -875,6 +998,24 @@ def _pretty_print(command: str, result: dict[str, Any]) -> None:
         
         for w in result.get("warnings", []):
             print(f"   ⚠️  {w}")
+    
+    elif command == "intercept-handoff":
+        if result.get("allowed"):
+            print(f"✅ HANDOFF ALLOWED: {result['from_agent']} → {result['to_agent']}")
+            print(f"   Task: {result['task_id']}")
+            print(f"   Tokens spent: {result.get('tokens_spent', 0):,}")
+            print(f"   Budget remaining: {result.get('remaining_budget', 0):,}")
+            print(f"   Handoff #{result.get('handoff_number', '?')} (remaining: {result.get('remaining_handoffs', 0)})")
+            print("   → Proceed with sessions_send")
+            
+            for w in result.get("warnings", []):
+                print(f"   ⚠️  {w}")
+        else:
+            print(f"🛑 HANDOFF BLOCKED: {result['from_agent']} → {result['to_agent']}")
+            print(f"   Task: {result['task_id']}")
+            print(f"   Reason: {result.get('reason', 'Unknown')}")
+            print(f"   {result.get('message', '')}")
+            print("   → Do NOT call sessions_send")
     
     elif command == "validate-result":
         if result.get("valid"):
